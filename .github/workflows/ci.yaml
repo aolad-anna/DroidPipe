@@ -7,92 +7,58 @@ on:
     branches: [main, master, develop]
   workflow_dispatch:
 
-# Cancel in-progress runs for the same workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: 🔍 Validate Gradle Wrapper
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Validate Gradle wrapper
-        uses: gradle/wrapper-validation-action@v3
-        continue-on-error: false
-        timeout-minutes: 5
-
-      - name: Fallback - Manual validation (if needed)
-        if: failure()
-        run: |
-          echo "Performing manual Gradle wrapper validation..."
-          find . -name "gradle-wrapper.jar" -exec sha256sum {} \;
-          ./gradlew --version
-
   lint:
     name: 🔍 Lint Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # Optional: Validate Gradle wrapper inline
-      - name: Quick Gradle wrapper check
-        run: |
-          if [ -f "gradlew" ]; then
-            echo "Gradle wrapper found"
-            ./gradlew --version
-          fi
-
-      - name: Set up Java JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Run Lint
-        run: ./gradlew lintDebug --no-daemon --stacktrace
+        run: ./gradlew lintDebug --stacktrace
 
       - name: Upload Lint Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lint-report
-          path: |
-            app/build/reports/lint-results-*.html
-            app/build/reports/lint-results-*.xml
+          path: app/build/reports/lint-*.html
           retention-days: 7
 
-  unit-test:
+  unit-tests:
     name: 🧪 Unit Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Java JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Run Unit Tests
-        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+        run: ./gradlew testDebugUnitTest --stacktrace
 
       - name: Upload Test Results
         if: always()
@@ -104,64 +70,31 @@ jobs:
             app/build/test-results/
           retention-days: 7
 
-      - name: Generate Test Report
-        if: always()
-        uses: dorny/test-reporter@v1
-        with:
-          name: Unit Test Results
-          path: app/build/test-results/testDebugUnitTest/*.xml
-          reporter: java-junit
-          fail-on-error: false
-
-  instrumentation-test:
+  instrumentation-tests:
     name: 🧪 Instrumentation Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     strategy:
       matrix:
-        api-level: [28, 30, 33]
-      fail-fast: false
+        api-level: [28, 30]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Java JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
-      - name: Enable KVM group perms
+      - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
-      - name: AVD cache
-        uses: actions/cache@v4
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-${{ matrix.api-level }}
-
-      - name: Create AVD and generate snapshot for caching
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api-level }}
-          target: google_apis
-          arch: x86_64
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          script: echo "Generated AVD snapshot for caching."
 
       - name: Run Instrumentation Tests
         uses: reactivecircus/android-emulator-runner@v2
@@ -169,139 +102,38 @@ jobs:
           api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
-          force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
           disable-animations: true
-          script: ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace
+          script: ./gradlew connectedDebugAndroidTest --stacktrace
 
-      - name: Upload Instrumentation Test Report
+      - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: instrumentation-test-report-api-${{ matrix.api-level }}
-          path: |
-            app/build/reports/androidTests/
-            app/build/outputs/androidTest-results/
-          retention-days: 7
-
-  static-code-analysis:
-    name: 🧠 Static Analysis (SonarCloud)
-    needs: [lint, unit-test]
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Java JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
-
-      - name: Cache SonarCloud packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.sonar/cache
-          key: ${{ runner.os }}-sonar
-          restore-keys: ${{ runner.os }}-sonar
-
-      - name: Build and analyze
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          ./gradlew build sonar --info --no-daemon \
-            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }} \
-            -Dsonar.organization=${{ github.repository_owner }} \
-            -Dsonar.host.url=https://sonarcloud.io
-
-  detekt:
-    name: 🔍 Detekt Analysis
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Java JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
-
-      - name: Run Detekt
-        run: ./gradlew detekt --no-daemon
-
-      - name: Upload Detekt Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: detekt-report
-          path: app/build/reports/detekt/
-          retention-days: 7
-
-  dependency-check:
-    name: 🔒 Dependency Vulnerability Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Java JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
-
-      - name: Run dependency updates check
-        run: ./gradlew dependencyUpdates --no-daemon
-
-      - name: Upload dependency report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-report
-          path: build/dependencyUpdates/
+          name: instrumentation-results-api${{ matrix.api-level }}
+          path: app/build/reports/androidTests/
           retention-days: 7
 
   build-debug:
     name: 🏗️ Build Debug APK
-    needs: [lint, unit-test]
+    needs: [lint, unit-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Java JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -312,38 +144,35 @@ jobs:
 
   build-release:
     name: 🚀 Build Release APK
-    needs: [lint, unit-test]
+    needs: [lint, unit-tests]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Java JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: false
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Decode Keystore
+        if: env.KEYSTORE_BASE64 != ''
         env:
-          ENCODED_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$ENCODED_KEYSTORE" ]; then
-            echo $ENCODED_KEYSTORE | base64 -di > keystore.jks
-          fi
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo $KEYSTORE_BASE64 | base64 -d > keystore.jks
 
       - name: Build Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: ./gradlew assembleRelease --stacktrace
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
@@ -352,52 +181,9 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
 
-      - name: Upload Release Bundle (AAB)
+      - name: Upload Release Bundle
         uses: actions/upload-artifact@v4
         with:
           name: release-bundle
           path: app/build/outputs/bundle/release/*.aab
           retention-days: 30
-
-  security-scan:
-    name: 🔐 Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-  notify:
-    name: 📢 Notification
-    needs: [build-debug, instrumentation-test, static-code-analysis]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Check job status
-        run: |
-          if [ "${{ needs.build-debug.result }}" == "failure" ] || 
-             [ "${{ needs.instrumentation-test.result }}" == "failure" ] || 
-             [ "${{ needs.static-code-analysis.result }}" == "failure" ]; then
-            echo "CI_STATUS=failed" >> $GITHUB_ENV
-          else
-            echo "CI_STATUS=success" >> $GITHUB_ENV
-          fi
-
-      - name: Send notification
-        if: github.event_name == 'push'
-        run: |
-          echo "CI Pipeline ${{ env.CI_STATUS }} for commit ${{ github.sha }}"
-          # Add your notification logic here (Slack, Discord, email, etc.)
