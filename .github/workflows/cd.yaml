@@ -1,61 +1,419 @@
-name: CD
+name: CI/CD
 
 on:
-  workflow_run:
-    workflows: ["ci"]
-    types:
-      - completed
+  push:
+    branches: [main, master, develop]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  apk:
-    name: Build Release signed APK
+  lint:
+    name: 🔍 Lint Check
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the code
-        uses: actions/checkout@v2
-  
-      - name: Set up JDK
-        uses: actions/setup-java@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
-  
-      - name: Build Release APK
-        run: ./gradlew assembleRelease
-  
-      - name: Sign APK
-        uses: r0adkll/sign-android-release@v1
-        id: sign_app
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run Lint
+        run: ./gradlew lintDebug --stacktrace
+
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          releaseDirectory: app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "30.0.2"
-  
-      - name: Upload Signed APK
-        uses: actions/upload-artifact@v2
-        with:
-          name: sample-app-signed  # Artifact Name
-          path: app/build/outputs/apk/release/*.apk 
-  
-  deploy:
-    name: Deploy release AAB on Playstore
-    needs: [apk]
+          name: lint-report
+          path: app/build/reports/lint-*.html
+          retention-days: 7
+
+  unit-tests:
+    name: 🧪 Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - name: Create service_account.json
-        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > service_account.json
-  
-      - name: Deploy to Play Store
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          retention-days: 7
+
+  instrumentation-tests:
+    name: 🧪 Instrumentation Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        api-level: [28, 30]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Instrumentation Tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          arch: x86_64
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: ./gradlew connectedDebugAndroidTest --stacktrace
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-results-api${{ matrix.api-level }}
+          path: app/build/reports/androidTests/
+          retention-days: 7
+
+  build-debug:
+    name: 🏗️ Build Debug APK
+    needs: [lint, unit-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  build-release:
+    name: 🚀 Build Release
+    needs: [lint, unit-tests, instrumentation-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(./gradlew -q printVersion 2>/dev/null || echo "1.0.0")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Decode Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo $KEYSTORE_BASE64 | base64 -d > keystore.jks
+          fi
+
+      - name: Build Release APK & Bundle
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease --stacktrace
+          ./gradlew bundleRelease --stacktrace
+
+      - name: Sign APK (if needed)
+        if: env.KEYSTORE_PASSWORD != ''
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "APK signing handled by Gradle"
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 90
+
+      - name: Upload Release Bundle (AAB)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: app/build/outputs/bundle/release/*.aab
+          retention-days: 90
+
+      - name: Upload Mapping File
+        uses: actions/upload-artifact@v4
+        with:
+          name: mapping
+          path: app/build/outputs/mapping/release/mapping.txt
+          retention-days: 90
+
+  # ==================== DEPLOYMENT JOBS ====================
+
+  deploy-firebase:
+    name: 🔥 Deploy to Firebase App Distribution
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apk
+          path: apk/
+
+      - name: Deploy to Firebase
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_CREDENTIALS }}
+          groups: testers
+          file: apk/app-release.apk
+          releaseNotes: |
+            Build: ${{ github.run_number }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+
+  deploy-play-store-internal:
+    name: 📦 Deploy to Play Store (Internal Testing)
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: bundle/
+
+      - name: Deploy to Play Store Internal Track
         uses: r0adkll/upload-google-play@v1
         with:
-          serviceAccountJson: service_account.json
-          packageName: ${{ github.event.inputs.app_id }}
-          releaseFiles: app/build/outputs/bundle/release/*.aab
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
+          packageName: com.yourcompany.yourapp
+          releaseFiles: bundle/*.aab
           track: internal
+          status: completed
           whatsNewDirectory: whatsnew/
           mappingFile: app/build/outputs/mapping/release/mapping.txt
+
+  deploy-play-store-beta:
+    name: 📦 Deploy to Play Store (Beta)
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: bundle/
+
+      - name: Deploy to Play Store Beta Track
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
+          packageName: com.yourcompany.yourapp
+          releaseFiles: bundle/*.aab
+          track: beta
+          status: completed
+          inAppUpdatePriority: 3
+          whatsNewDirectory: whatsnew/
+          mappingFile: app/build/outputs/mapping/release/mapping.txt
+
+  deploy-play-store-production:
+    name: 🚀 Deploy to Play Store (Production)
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://play.google.com/store/apps/details?id=com.yourcompany.yourapp
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: bundle/
+
+      - name: Deploy to Play Store Production
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
+          packageName: com.yourcompany.yourapp
+          releaseFiles: bundle/*.aab
+          track: production
+          status: completed
           inAppUpdatePriority: 5
+          userFraction: 0.1
+          whatsNewDirectory: whatsnew/
+          mappingFile: app/build/outputs/mapping/release/mapping.txt
+
+  create-github-release:
+    name: 📝 Create GitHub Release
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apk
+          path: apk/
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: bundle/
+
+      - name: Download Mapping
+        uses: actions/download-artifact@v4
+        with:
+          name: mapping
+          path: mapping/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            apk/*.apk
+            bundle/*.aab
+            mapping/mapping.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-slack:
+    name: 📢 Notify Slack
+    needs: [deploy-firebase, deploy-play-store-internal, deploy-play-store-beta, deploy-play-store-production]
+    runs-on: ubuntu-latest
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - name: Determine deployment status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy-firebase.result }}" == "failure" ]] || 
+             [[ "${{ needs.deploy-play-store-internal.result }}" == "failure" ]] || 
+             [[ "${{ needs.deploy-play-store-beta.result }}" == "failure" ]] || 
+             [[ "${{ needs.deploy-play-store-production.result }}" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} Deployment ${{ steps.status.outputs.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment ${{ steps.status.outputs.status }}*\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.event.head_commit.url }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
