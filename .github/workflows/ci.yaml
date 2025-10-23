@@ -53,7 +53,7 @@ jobs:
           path: app/build/reports/lint-results-debug.html
 
   instrumentation-test:
-    name: 🧪 Instrumentation Tests
+    name: 🧪 Instrumentation Tests (Espresso)
     needs: [lint]
     runs-on: macos-latest
     steps:
@@ -73,6 +73,8 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
+          target: google_apis
+          arch: x86_64
           script: ./gradlew connectedCheck
 
       - name: Upload Instrumentation Test Report
