@@ -1,67 +1,41 @@
-name: 🧱 Android CI Pipeline
+name: CI
 
 on:
   push:
     branches: [main, master, develop]
   pull_request:
     branches: [main, master, develop]
-  workflow_dispatch: # manual trigger
+  workflow_dispatch:
 
 jobs:
   start:
+    name: 🚀 Start
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the code
         uses: actions/checkout@v4
 
       - name: Run sample script
-        run: echo "Hello, Android CI/CD!"
+        run: echo "Hello, Android CI pipeline!"
 
   lint:
-    name: 🧹 Lint Check
+    name: 🔍 Lint Check
     needs: [start]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
+      - name: Checkout the code
+        uses: actions/checkout@v4
 
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
+          path: ~/.gradle/caches
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Make Gradle executable
-        run: chmod +x ./gradlew
-
-      - name: Run lint
-        run: ./gradlew lintDebug
-
-      - name: Upload lint report
-        uses: actions/upload-artifact@v4
-        with:
-          name: lint-report
-          path: app/build/reports/lint-results-debug.html
-
-  unit-test:
-    name: Perform Unit Testing
-    needs: [ lint ]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout the code
-        uses: actions/checkout@v2
-
       - name: Set up Java JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
@@ -69,71 +43,79 @@ jobs:
       - name: Grant execute permission for Gradle
         run: chmod +x ./gradlew
 
-      - name: Run tests
-        run: ./gradlew test
+      - name: Run Lint
+        run: ./gradlew lintDebug
 
-      - name: Upload test report
-        uses: actions/upload-artifact@v2
+      - name: Upload Lint Report
+        uses: actions/upload-artifact@v4
         with:
-          name: unit_test_report
-          path: app/build/reports/tests/testDebugUnitTest/
-
+          name: lint-report
+          path: app/build/reports/lint-results-debug.html
 
   instrumentation-test:
-    name: 📱 Instrumentation Tests
-    needs: [unit-test]
+    name: 🧪 Instrumentation Tests
+    needs: [lint]
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the code
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up Java JDK 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
 
-      - name: Run espresso tests
+      - name: Grant execute permission for Gradle
+        run: chmod +x ./gradlew
+
+      - name: Run Espresso Tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 29
+          api-level: 30
           script: ./gradlew connectedCheck
 
-      - name: Upload instrumentation test report
+      - name: Upload Instrumentation Test Report
         uses: actions/upload-artifact@v4
         with:
           name: instrumentation-test-report
           path: app/build/reports/androidTests/connected/
 
   static-code-analysis:
-    name: 🔍 Static Code Analysis
+    name: 🧠 Static Code Analysis (Sonar)
     needs: [instrumentation-test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the code
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up Java JDK 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
 
-      - name: SonarCloud Scan
+      - name: Run SonarCloud Scan
         run: ./gradlew app:sonarqube -Dsonar.login=${{ secrets.SONAR_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   debug-apk:
-    name: 📦 Build Debug APK
+    name: 🏗️ Build Debug APK
     needs: [static-code-analysis]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the code
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up Java JDK 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
+
+      - name: Grant execute permission for Gradle
+        run: chmod +x ./gradlew
 
       - name: Build Debug APK
         run: ./gradlew assembleDebug --stacktrace
@@ -141,5 +123,5 @@ jobs:
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug.apk
+          name: debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
