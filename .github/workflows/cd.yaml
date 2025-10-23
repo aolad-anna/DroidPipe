@@ -1,156 +1,58 @@
-name: CI/CD
+name: CD
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
     branches: [main, master, develop]
+  push:
     tags:
       - 'v*'
-  pull_request:
-    branches: [main, master, develop]
   workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      deployment_target:
+        description: 'Deployment Target'
+        required: true
+        type: choice
+        options:
+          - firebase
+          - play-store-internal
+          - play-store-beta
+          - play-store-production
 
 jobs:
-  lint:
-    name: 🔍 Lint Check
+  check-ci-status:
+    name: ✅ Check CI Status
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run'
+    outputs:
+      ci-success: ${{ steps.check.outputs.success }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Run Lint
-        run: ./gradlew lintDebug --stacktrace
-
-      - name: Upload Lint Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lint-report
-          path: app/build/reports/lint-*.html
-          retention-days: 7
-
-  unit-tests:
-    name: 🧪 Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Run Unit Tests
-        run: ./gradlew testDebugUnitTest --stacktrace
-
-      - name: Upload Test Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-test-results
-          path: |
-            app/build/reports/tests/
-            app/build/test-results/
-          retention-days: 7
-
-  instrumentation-tests:
-    name: 🧪 Instrumentation Tests
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        api-level: [28, 30]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Enable KVM
+      - name: Check CI workflow status
+        id: check
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+          if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "✅ CI passed successfully"
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ CI failed or was cancelled"
+            exit 1
+          fi
 
-      - name: Run Instrumentation Tests
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api-level }}
-          target: google_apis
-          arch: x86_64
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
-          disable-animations: true
-          script: ./gradlew connectedDebugAndroidTest --stacktrace
-
-      - name: Upload Test Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: instrumentation-results-api${{ matrix.api-level }}
-          path: app/build/reports/androidTests/
-          retention-days: 7
-
-  build-debug:
-    name: 🏗️ Build Debug APK
-    needs: [lint, unit-tests]
+  prepare-release:
+    name: 🎯 Prepare Release
+    needs: [check-ci-status]
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
-
-  build-release:
-    name: 🚀 Build Release
-    needs: [lint, unit-tests, instrumentation-tests]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+    if: |
+      always() && 
+      (needs.check-ci-status.outputs.ci-success == 'true' || 
+       github.event_name == 'workflow_dispatch' || 
+       startsWith(github.ref, 'refs/tags/v'))
     outputs:
       version: ${{ steps.version.outputs.version }}
+      build-number: ${{ steps.version.outputs.build-number }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -167,16 +69,19 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Get version
+      - name: Get version information
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
           else
-            VERSION=$(./gradlew -q printVersion 2>/dev/null || echo "1.0.0")
+            VERSION=$(./gradlew -q printVersion 2>/dev/null || echo "1.0.${{ github.run_number }}")
           fi
+          BUILD_NUMBER=${{ github.run_number }}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
+          echo "build-number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+          echo "📦 Version: $VERSION"
+          echo "🔢 Build: $BUILD_NUMBER"
 
       - name: Decode Keystore
         env:
@@ -184,25 +89,24 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo $KEYSTORE_BASE64 | base64 -d > keystore.jks
+            echo "✅ Keystore decoded"
+          else
+            echo "⚠️ No keystore provided"
           fi
 
-      - name: Build Release APK & Bundle
+      - name: Build Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          ./gradlew assembleRelease --stacktrace
-          ./gradlew bundleRelease --stacktrace
+        run: ./gradlew assembleRelease --stacktrace
 
-      - name: Sign APK (if needed)
-        if: env.KEYSTORE_PASSWORD != ''
+      - name: Build Release Bundle (AAB)
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          echo "APK signing handled by Gradle"
+        run: ./gradlew bundleRelease --stacktrace
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
@@ -211,27 +115,31 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
 
-      - name: Upload Release Bundle (AAB)
+      - name: Upload Release Bundle
         uses: actions/upload-artifact@v4
         with:
           name: release-bundle
           path: app/build/outputs/bundle/release/*.aab
           retention-days: 90
 
-      - name: Upload Mapping File
+      - name: Upload ProGuard Mapping
         uses: actions/upload-artifact@v4
         with:
-          name: mapping
-          path: app/build/outputs/mapping/release/mapping.txt
+          name: mapping-files
+          path: app/build/outputs/mapping/release/
           retention-days: 90
 
-  # ==================== DEPLOYMENT JOBS ====================
-
   deploy-firebase:
-    name: 🔥 Deploy to Firebase App Distribution
-    needs: [build-release]
+    name: 🔥 Deploy to Firebase
+    needs: [prepare-release]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_target == 'firebase' ||
+      github.ref == 'refs/heads/develop' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/master'
+    environment:
+      name: firebase-distribution
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -242,7 +150,7 @@ jobs:
           name: release-apk
           path: apk/
 
-      - name: Deploy to Firebase
+      - name: Deploy to Firebase App Distribution
         uses: wzieba/Firebase-Distribution-Github-Action@v1
         with:
           appId: ${{ secrets.FIREBASE_APP_ID }}
@@ -250,15 +158,26 @@ jobs:
           groups: testers
           file: apk/app-release.apk
           releaseNotes: |
-            Build: ${{ github.run_number }}
-            Commit: ${{ github.sha }}
-            Branch: ${{ github.ref_name }}
+            🚀 Build: ${{ needs.prepare-release.outputs.build-number }}
+            📝 Version: ${{ needs.prepare-release.outputs.version }}
+            🔀 Branch: ${{ github.ref_name }}
+            👤 Author: ${{ github.actor }}
+            📅 Date: ${{ github.event.head_commit.timestamp }}
 
-  deploy-play-store-internal:
-    name: 📦 Deploy to Play Store (Internal Testing)
-    needs: [build-release]
+      - name: Notify Firebase deployment
+        run: |
+          echo "✅ Successfully deployed to Firebase App Distribution"
+          echo "🔗 Check your Firebase Console for download link"
+
+  deploy-play-internal:
+    name: 📦 Deploy to Play Store (Internal)
+    needs: [prepare-release]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_target == 'play-store-internal' ||
+      github.ref == 'refs/heads/develop'
+    environment:
+      name: play-store-internal
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -269,22 +188,36 @@ jobs:
           name: release-bundle
           path: bundle/
 
-      - name: Deploy to Play Store Internal Track
+      - name: Download Mapping
+        uses: actions/download-artifact@v4
+        with:
+          name: mapping-files
+          path: mapping/
+
+      - name: Deploy to Internal Testing Track
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
-          packageName: com.yourcompany.yourapp
+          packageName: ${{ secrets.PACKAGE_NAME }}
           releaseFiles: bundle/*.aab
           track: internal
           status: completed
           whatsNewDirectory: whatsnew/
-          mappingFile: app/build/outputs/mapping/release/mapping.txt
+          mappingFile: mapping/mapping.txt
 
-  deploy-play-store-beta:
+      - name: Notify Internal deployment
+        run: echo "✅ Deployed to Play Store Internal Testing Track"
+
+  deploy-play-beta:
     name: 📦 Deploy to Play Store (Beta)
-    needs: [build-release]
+    needs: [prepare-release]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_target == 'play-store-beta' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/master'
+    environment:
+      name: play-store-beta
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -295,26 +228,37 @@ jobs:
           name: release-bundle
           path: bundle/
 
-      - name: Deploy to Play Store Beta Track
+      - name: Download Mapping
+        uses: actions/download-artifact@v4
+        with:
+          name: mapping-files
+          path: mapping/
+
+      - name: Deploy to Beta Track
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
-          packageName: com.yourcompany.yourapp
+          packageName: ${{ secrets.PACKAGE_NAME }}
           releaseFiles: bundle/*.aab
           track: beta
           status: completed
           inAppUpdatePriority: 3
           whatsNewDirectory: whatsnew/
-          mappingFile: app/build/outputs/mapping/release/mapping.txt
+          mappingFile: mapping/mapping.txt
 
-  deploy-play-store-production:
+      - name: Notify Beta deployment
+        run: echo "✅ Deployed to Play Store Beta Track"
+
+  deploy-play-production:
     name: 🚀 Deploy to Play Store (Production)
-    needs: [build-release]
+    needs: [prepare-release]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_target == 'play-store-production' ||
+      startsWith(github.ref, 'refs/tags/v')
     environment:
       name: production
-      url: https://play.google.com/store/apps/details?id=com.yourcompany.yourapp
+      url: https://play.google.com/store/apps/details?id=${{ secrets.PACKAGE_NAME }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -325,22 +269,33 @@ jobs:
           name: release-bundle
           path: bundle/
 
-      - name: Deploy to Play Store Production
+      - name: Download Mapping
+        uses: actions/download-artifact@v4
+        with:
+          name: mapping-files
+          path: mapping/
+
+      - name: Deploy to Production Track
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CREDENTIALS }}
-          packageName: com.yourcompany.yourapp
+          packageName: ${{ secrets.PACKAGE_NAME }}
           releaseFiles: bundle/*.aab
           track: production
           status: completed
           inAppUpdatePriority: 5
           userFraction: 0.1
           whatsNewDirectory: whatsnew/
-          mappingFile: app/build/outputs/mapping/release/mapping.txt
+          mappingFile: mapping/mapping.txt
+
+      - name: Notify Production deployment
+        run: |
+          echo "🚀 Deployed to Play Store Production"
+          echo "📊 Staged rollout: 10% of users"
 
   create-github-release:
     name: 📝 Create GitHub Release
-    needs: [build-release]
+    needs: [prepare-release, deploy-play-production]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -364,56 +319,138 @@ jobs:
       - name: Download Mapping
         uses: actions/download-artifact@v4
         with:
-          name: mapping
+          name: mapping-files
           path: mapping/
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             apk/*.apk
             bundle/*.aab
             mapping/mapping.txt
+          body: |
+            ## 🚀 Release ${{ needs.prepare-release.outputs.version }}
+            
+            ### 📦 Build Information
+            - **Version**: ${{ needs.prepare-release.outputs.version }}
+            - **Build Number**: ${{ needs.prepare-release.outputs.build-number }}
+            - **Date**: ${{ github.event.head_commit.timestamp }}
+            
+            ### 📥 Downloads
+            - **APK**: For direct installation
+            - **AAB**: Google Play Store bundle
+            - **Mapping**: ProGuard/R8 mapping file
+            
+            ### 🔗 Links
+            - [View on Google Play Store](https://play.google.com/store/apps/details?id=${{ secrets.PACKAGE_NAME }})
           generate_release_notes: true
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  notify-slack:
-    name: 📢 Notify Slack
-    needs: [deploy-firebase, deploy-play-store-internal, deploy-play-store-beta, deploy-play-store-production]
+  notify-deployment:
+    name: 📢 Send Notifications
+    needs: [deploy-firebase, deploy-play-internal, deploy-play-beta, deploy-play-production]
     runs-on: ubuntu-latest
-    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+    if: always()
     steps:
-      - name: Determine deployment status
+      - name: Determine status
         id: status
         run: |
           if [[ "${{ needs.deploy-firebase.result }}" == "failure" ]] || 
-             [[ "${{ needs.deploy-play-store-internal.result }}" == "failure" ]] || 
-             [[ "${{ needs.deploy-play-store-beta.result }}" == "failure" ]] || 
-             [[ "${{ needs.deploy-play-store-production.result }}" == "failure" ]]; then
+             [[ "${{ needs.deploy-play-internal.result }}" == "failure" ]] || 
+             [[ "${{ needs.deploy-play-beta.result }}" == "failure" ]] || 
+             [[ "${{ needs.deploy-play-production.result }}" == "failure" ]]; then
             echo "status=failure" >> $GITHUB_OUTPUT
             echo "emoji=❌" >> $GITHUB_OUTPUT
-          else
+            echo "color=danger" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy-firebase.result }}" == "success" ]] || 
+               [[ "${{ needs.deploy-play-internal.result }}" == "success" ]] || 
+               [[ "${{ needs.deploy-play-beta.result }}" == "success" ]] || 
+               [[ "${{ needs.deploy-play-production.result }}" == "success" ]]; then
             echo "status=success" >> $GITHUB_OUTPUT
             echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "emoji=⏭️" >> $GITHUB_OUTPUT
+            echo "color=warning" >> $GITHUB_OUTPUT
           fi
 
       - name: Send Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
         uses: slackapi/slack-github-action@v1
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           payload: |
             {
               "text": "${{ steps.status.outputs.emoji }} Deployment ${{ steps.status.outputs.status }}",
-              "blocks": [
+              "attachments": [
                 {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Deployment ${{ steps.status.outputs.status }}*\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.event.head_commit.url }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}"
-                  }
+                  "color": "${{ steps.status.outputs.color }}",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "value": "${{ steps.status.outputs.status }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Commit",
+                      "value": "<${{ github.event.head_commit.url }}|${{ github.sha }}>",
+                      "short": true
+                    },
+                    {
+                      "title": "Author",
+                      "value": "${{ github.actor }}",
+                      "short": true
+                    }
+                  ]
                 }
               ]
             }
+
+      - name: Send Discord notification
+        if: vars.DISCORD_WEBHOOK_URL != ''
+        run: |
+          curl -H "Content-Type: application/json" \
+               -d '{
+                 "username": "Android CD Bot",
+                 "avatar_url": "https://developer.android.com/static/images/brand/Android_Robot.png",
+                 "embeds": [{
+                   "title": "${{ steps.status.outputs.emoji }} Deployment ${{ steps.status.outputs.status }}",
+                   "color": '"$([ "${{ steps.status.outputs.status }}" == "success" ] && echo "3066993" || echo "15158332")"',
+                   "fields": [
+                     {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                     {"name": "Author", "value": "${{ github.actor }}", "inline": true},
+                     {"name": "Commit", "value": "[View](${{ github.event.head_commit.url }})", "inline": true}
+                   ],
+                   "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"'"
+                 }]
+               }' \
+               ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Send Email notification
+        if: vars.NOTIFICATION_EMAIL != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "${{ steps.status.outputs.emoji }} Android Deployment ${{ steps.status.outputs.status }}"
+          to: ${{ vars.NOTIFICATION_EMAIL }}
+          from: Android CI/CD
+          body: |
+            Deployment Status: ${{ steps.status.outputs.status }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            
+            View workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
