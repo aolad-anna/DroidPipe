@@ -1,0 +1,506 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version name for release (e.g., 1.0.0)'
+        required: false
+        default: '1.0.0'
+      deploy_to_production:
+        description: 'Deploy to production?'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.0'
+
+jobs:
+  # ============================================
+  # CI JOBS - Quality, Testing, Security
+  # ============================================
+
+  lint:
+    name: Code Quality & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run Android Lint
+        run: ./gradlew lintDebug
+
+      - name: Run Kotlin Lint (ktlint)
+        run: ./gradlew ktlintCheck
+
+      - name: Upload Lint Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/reports/ktlint/
+          retention-days: 7
+
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Generate Test Coverage Report
+        run: ./gradlew jacocoTestReport
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/reports/jacoco/jacocoTestReport/
+          retention-days: 7
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml
+          fail_ci_if_error: false
+          flags: unittests
+          name: codecov-droidpipe
+
+  instrumentation-test:
+    name: Instrumentation Tests
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    strategy:
+      matrix:
+        api-level: [29, 30, 33]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ matrix.api-level }}
+
+      - name: Run Instrumentation Tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          profile: Nexus 6
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: ./gradlew connectedDebugAndroidTest
+
+      - name: Upload Instrumentation Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-test-reports-api-${{ matrix.api-level }}
+          path: app/build/reports/androidTests/connected/
+          retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [lint]
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/gradle@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --sarif-file-output=snyk.sarif
+
+      - name: Upload Snyk SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request'
+
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build and analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: ./gradlew build sonar --info
+
+  build-debug:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+
+  # ============================================
+  # CD JOBS - Build, Sign, Release, Deploy
+  # ============================================
+
+  build-release-apk:
+    name: Build & Sign Release APK
+    runs-on: ubuntu-latest
+    needs: [lint, unit-test, security-scan, build-debug]
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'workflow_dispatch'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Extract version name
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.version }}
+
+      - name: Sign APK
+        id: sign_apk
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0"
+
+      - name: Rename Signed APK
+        run: |
+          mv ${{ steps.sign_apk.outputs.signedReleaseFile }} app/build/outputs/apk/release/droidpipe-v${{ steps.version.outputs.version }}.apk
+
+      - name: Upload Signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apk
+          path: app/build/outputs/apk/release/droidpipe-v${{ steps.version.outputs.version }}.apk
+          retention-days: 30
+
+  build-release-aab:
+    name: Build & Sign Release AAB
+    runs-on: ubuntu-latest
+    needs: [build-release-apk]
+    outputs:
+      aab_path: ${{ steps.sign_aab.outputs.signedReleaseFile }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Release AAB
+        run: ./gradlew bundleRelease
+        env:
+          VERSION_NAME: ${{ needs.build-release-apk.outputs.version }}
+
+      - name: Sign AAB
+        id: sign_aab
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/bundle/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0"
+
+      - name: Upload Signed AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-aab
+          path: ${{ steps.sign_aab.outputs.signedReleaseFile }}
+          retention-days: 30
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-release-apk, build-release-aab]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-apk
+          path: ./release
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-aab
+          path: ./release
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "notes=Manual release v${{ needs.build-release-apk.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "notes=Release ${{ needs.build-release-apk.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build-release-apk.outputs.version }}
+          name: Release v${{ needs.build-release-apk.outputs.version }}
+          body: ${{ steps.release_notes.outputs.notes }}
+          files: |
+            ./release/*.apk
+            ./release/*.aab
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-internal:
+    name: Deploy to Play Store (Internal)
+    runs-on: ubuntu-latest
+    needs: [build-release-aab]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-aab
+          path: ./
+
+      - name: Create service account JSON
+        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > service_account.json
+
+      - name: Deploy to Internal Testing
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: service_account.json
+          packageName: com.droidpipe.app
+          releaseFiles: '*.aab'
+          track: internal
+          status: completed
+          inAppUpdatePriority: 2
+
+  deploy-production:
+    name: Deploy to Play Store (Production)
+    runs-on: ubuntu-latest
+    needs: [deploy-internal]
+    if: |
+      (github.event_name == 'workflow_dispatch' && 
+       github.event.inputs.deploy_to_production == 'true')
+    environment:
+      name: production
+      url: https://play.google.com/store/apps/details?id=com.droidpipe.app
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-aab
+          path: ./
+
+      - name: Create service account JSON
+        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > service_account.json
+
+      - name: Deploy to Production
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: service_account.json
+          packageName: com.droidpipe.app
+          releaseFiles: '*.aab'
+          track: production
+          status: completed
+          inAppUpdatePriority: 5
+          userFraction: 0.1  # Staged rollout - 10% initially
+
+  # ============================================
+  # SUCCESS NOTIFICATIONS
+  # ============================================
+
+  ci-success:
+    name: CI Pipeline Success
+    runs-on: ubuntu-latest
+    needs: [lint, unit-test, instrumentation-test, security-scan, build-debug]
+    if: |
+      success() && 
+      (github.event_name == 'pull_request' || 
+       (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')))
+    steps:
+      - name: Success Message
+        run: |
+          echo "✅ All CI checks passed successfully!"
+          echo "🎉 Code is ready for review/merge"
+
+  cd-success:
+    name: CD Pipeline Success
+    runs-on: ubuntu-latest
+    needs: [create-github-release, deploy-internal]
+    if: success()
+    steps:
+      - name: Success Message
+        run: |
+          echo "🚀 Deployment successful!"
+          echo "✅ APK and AAB uploaded to GitHub Releases"
+          echo "✅ App deployed to Google Play Internal Testing"
+          echo "📱 Version: ${{ needs.build-release-apk.outputs.version }}"
